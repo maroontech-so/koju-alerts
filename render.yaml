@@ -1,5 +1,5 @@
 services:
-  - type: worker
+  - type: web                       # ← was: worker
     name: kojo-alert
     runtime: python
     plan: starter
