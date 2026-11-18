@@ -1,0 +1,50 @@
+services:
+  - type: worker
+    name: kojo-alert
+    runtime: python
+    plan: starter
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    autoDeploy: true
+    disk:
+      name: kojo-alert-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: SESSION_STRING
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: FIREBASE_PROJECT_ID
+        sync: false
+      - key: CHANNEL_USERNAME
+        value: kojoforextrades
+      - key: DATABASE_PATH
+        value: /var/data/kojo_alerts.sqlite3
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-120b
+      - key: CONFIDENCE_THRESHOLD
+        value: "0.75"
+      - key: FCM_TOPIC
+        value: kojo-alerts
+      - key: FCM_CHANNEL_ID
+        value: kojo_alerts_critical
+      - key: GROQ_TIMEOUT_SECONDS
+        value: "60"
+      - key: LOG_LEVEL
+        value: INFO
+      - key: GROQ_FAST_PATH
+        value: "false"          # set to "true" for ~1s latency on clean single signals
+      - key: OUTBOX_POLL_SECONDS
+        value: "30"             # fallback poll only; new alerts dispatch instantly via events
+      - key: TELEGRAM_HISTORY_LIMIT
+        value: "10"

@@ -1,0 +1,52 @@
+# === Secrets — NEVER commit ===
+.env
+.env.*
+!.env.example
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+data/
+google-services.json
+*.session
+*.session-journal
+firebase-service-account*.json
+*.pem
+*.key
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# === IDE / OS ===
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# === Local debug artifacts ===
+check_token.py
+*.log
+*.bak
+# === Firebase / GCP service account keys — NEVER commit ===
+serviceAccountKey.json
+firebase-one-line.txt
+*serviceAccount*.json
+*firebase*one-line*
+*firebase*service*account*
+*.json.key
