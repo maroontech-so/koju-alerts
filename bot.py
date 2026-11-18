@@ -848,7 +848,7 @@ async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.exception("PTB handler error", exc_info=context.error)
 
 
-async def _polling_error_callback(exc: TelegramError) -> None:
+def _polling_error_callback(exc: TelegramError) -> None:
     """Silence the deploy-transition 409. Everything else gets a warning."""
     if isinstance(exc, Conflict):
         # Expected while Render swaps old→new instance. PTB retries automatically.
