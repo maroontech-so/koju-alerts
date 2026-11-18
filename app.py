@@ -28,7 +28,6 @@ import config
 from bot import register_handlers, broadcast_alert, reminder_loop
 from push import send_topic_alert, validate_firebase_config
 from signal_parser import parse_signals, valid_signals
-from web import web_server_loop
 
 logging.basicConfig(level=config.LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("kojo-alert")
@@ -718,8 +717,9 @@ async def main():
         asyncio.create_task(fcm_outbox_loop(), name="fcm-outbox"),
         asyncio.create_task(telegram_outbox_loop(telegram_app), name="telegram-outbox"),
         asyncio.create_task(reminder_loop(telegram_app, config.DATABASE_PATH), name="telegram-reminders"),
-        asyncio.create_task(web_server_loop(config.DATABASE_PATH), name="web-frontend"),  # ← NEW
+        # asyncio.create_task(web_server_loop(config.DATABASE_PATH), name="web-frontend"),
     ]
+
     log.info("KOJO ALERT worker started (fast_path=%s, outbox_poll=%ss, channel_poll=%ss)",
              config.GROQ_FAST_PATH, config.OUTBOX_POLL_SECONDS, config.CHANNEL_POLL_SECONDS)
 

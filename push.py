@@ -1,8 +1,9 @@
-"""Firebase Cloud Messaging publisher. One Android notification per parsed trade.
+"""Firebase Cloud Messaging publisher — minimal payload for low-bandwidth delivery.
 
-Payloads are marked high-priority and routed to a dedicated intrusive channel so
-the Android client can show a full-screen alert. The client is responsible for
-the full-screen intent; the server only tags the notification correctly.
+The FCM data payload is deliberately tiny (~250 bytes) so it arrives even on
+very slow links. Detailed content (original_text, full signal list) is fetched
+by the app via /api/alerts/since once the push lands. The FCM message is a
+"wake signal" — the app fetches the rest.
 """
 from __future__ import annotations
 
@@ -41,62 +42,50 @@ def _firebase_app():
 
 
 def validate_firebase_config() -> None:
-    """Raise on startup if credentials are malformed. Fails fast instead of retry-forever."""
     _firebase_app()
 
 
-def _string(value, limit=500):
+def _s(value, limit=200):
+    """Aggressively truncate — every byte matters on slow links."""
     return str(value if value is not None else "")[:limit]
 
 
+def _compact_tp(targets: list) -> str:
+    """Serialize take-profits as 'tp1|tp2|tp3' — ~8 bytes vs JSON's ~30 bytes."""
+    return "|".join(_s(x, 20) for x in (targets or [])[:5])
+
+
 def build_fcm_payload(alert: dict, signal: dict, index: int) -> dict[str, str]:
+    """Minimal payload — app fetches full details via /api/alerts/since.
+
+    Target size: ~250 bytes. Original was ~2000 bytes. That's the difference
+    between arriving on a 5 kbps link and not.
+    """
     message_id = int(alert["message_id"])
-    base_id = _string(alert.get("alert_id") or message_id, 64)
-    alert_id = f"{base_id}-{index + 1}"[:64]
-    direction = _string(signal.get("direction"), 12)
-    instrument = _string(signal.get("instrument"), 20)
-    order = _string(signal.get("order_type") or "MARKET", 12)
-    targets = signal.get("take_profit") or []
     return {
-        "alert_id": alert_id,
-        "message_id": str(message_id),
-        "source_url": _string(alert.get("source_url"), 300),
-        "title": f"KOJO ALERT — {direction} {instrument}",
-        "body": f"{order} · Entry {signal.get('entry')} · SL {signal.get('stop_loss')}",
-        "instrument": instrument,
-        "direction": direction,
-        "order_type": order,
-        "entry": _string(signal.get("entry"), 40),
-        "stop_loss": _string(signal.get("stop_loss"), 40),
-        "take_profit": json.dumps([_string(x, 40) for x in targets[:8]]),
-        "confidence": _string((alert.get("analysis") or {}).get("confidence", 0), 12),
-        "original_text": _string(alert.get("original_text"), 1000),
-        "signal_number": str(index + 1),
-        "signal_count": str(len((alert.get("analysis") or {}).get("signals") or [])),
-        # Priority hints for the Android client.
-        "priority": "high",
-        "channel_id": config.FCM_CHANNEL_ID,
-        "full_screen": "true",
-        "category": "kojo_trade_alert",
+        # Identity (needed for dedupe and catch-up sync)
+        "a": _s(alert.get("alert_id") or message_id, 64),   # alert_id
+        "m": str(message_id),                                # message_id
+        "u": _s(alert.get("source_url"), 120),              # source_url
+        "i": _s(signal.get("instrument"), 20),              # instrument
+        "d": _s(signal.get("direction"), 8),                # direction
+        "o": _s(signal.get("order_type") or "MARKET", 8),   # order_type
+        "e": _s(signal.get("entry"), 20),                   # entry
+        "s": _s(signal.get("stop_loss"), 20),               # stop_loss
+        "t": _compact_tp(signal.get("take_profit") or []),  # take_profit
+        "n": str(index + 1),                                # signal_number
+        "c": str(len((alert.get("analysis") or {}).get("signals") or [])),  # count
+        "k": "1",                                           # kind: "1"=signal, "0"=correction
     }
 
 
 def _correction_payload(alert: dict) -> dict[str, str]:
     return {
-        "alert_id": _string(alert.get("alert_id") or alert.get("message_id"), 64),
-        "message_id": str(alert["message_id"]),
-        "source_url": _string(alert.get("source_url"), 300),
-        "title": "KOJO ALERT — SOURCE POST UPDATED",
-        "body": "The original trading post was edited. Review it before acting on the previous signal.",
-        "instrument": "", "direction": "UPDATE", "order_type": "UPDATE",
-        "entry": "", "stop_loss": "", "take_profit": "[]",
-        "confidence": "1",
-        "original_text": _string(alert.get("original_text"), 1000),
-        "correction": "true", "signal_number": "0", "signal_count": "0",
-        "priority": "high",
-        "channel_id": config.FCM_CHANNEL_ID,
-        "full_screen": "true",
-        "category": "kojo_trade_alert",
+        "a": _s(alert.get("alert_id") or alert.get("message_id"), 64),
+        "m": str(alert["message_id"]),
+        "u": _s(alert.get("source_url"), 120),
+        "d": "UPDATE",
+        "k": "0",  # correction
     }
 
 
@@ -119,10 +108,9 @@ def send_topic_alert(alert: dict) -> list[str]:
             data=payload,
             android=messaging.AndroidConfig(
                 priority="high",
-                ttl=timedelta(hours=1),
-                # Data-only on purpose: the Android client builds the
-                # full-screen notification itself. A server-side Notification
-                # would prevent setFullScreenIntent from being attached.
+                ttl=timedelta(weeks=4),               # 28 days — FCM's max
+                collapse_key=f"kojo-{payload['m']}",  # collapse duplicates
+                direct_boot_ok=True,                  # deliver before unlock
             ),
         )
         message_ids.append(messaging.send(message, app=app))

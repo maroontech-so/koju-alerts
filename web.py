@@ -52,6 +52,76 @@ async def _stats(db_path: str) -> dict:
         async with db.execute("SELECT COUNT(*) FROM fcm_outbox_v2 WHERE sent_at IS NULL") as cur:
             fcm_pending = (await cur.fetchone())[0]
 
+async def handle_alerts_since(request: web.Request) -> web.Response:
+    """Return all validated strategies posted after the given marker.
+
+    Query params:
+      after    — message_id the client last saw (0 or omitted = from the beginning)
+      limit    — max items, default 20 (server caps at 50)
+
+    Response:
+      {
+        "alerts": [ { message_id, source_url, analysis, ... }, ... ],   # oldest first
+        "count": N,
+        "has_more": bool,
+        "latest_message_id": M
+      }
+
+    No auth required — payloads are the same read-only public summaries
+    shown on the index page. Detailed source text is only included for
+    validated strategies, which are already public in the source channel.
+    """
+    db_path = request.app["db_path"]
+    try:
+        after = int(request.query.get("after", "0") or "0")
+    except ValueError:
+        after = 0
+    try:
+        limit = max(1, min(50, int(request.query.get("limit", "20"))))
+    except ValueError:
+        limit = 20
+
+    async with aiosqlite.connect(db_path) as db:
+        async with db.execute(
+            "SELECT message_id, source_url, analysis_json FROM source_messages "
+            "WHERE status='done' AND message_id > ? AND analysis_json IS NOT NULL "
+            "ORDER BY message_id ASC LIMIT ?",
+            (after, limit + 1),
+        ) as cur:
+            rows = await cur.fetchall()
+
+    alerts = []
+    for message_id, url, raw in rows:
+        try:
+            analysis = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        if not (analysis.get("is_strategy") or analysis.get("correction")):
+            continue
+        alerts.append({
+            "alert_id": f"{message_id}-catchup",
+            "message_id": message_id,
+            "source_url": url,
+            "original_text": "",
+            "analysis": analysis,
+        })
+
+    has_more = len(alerts) > limit
+    alerts = alerts[:limit]
+
+    async with aiosqlite.connect(db_path) as db:
+        async with db.execute(
+            "SELECT MAX(message_id) FROM source_messages WHERE status='done'"
+        ) as cur:
+            row = await cur.fetchone()
+            latest = row[0] or 0
+
+    return web.json_response({
+        "alerts": alerts,
+        "count": len(alerts),
+        "has_more": has_more,
+        "latest_message_id": latest,
+    })
     return {
         "active_subscribers": active_subs,
         "total_subscribers": total_subs,
@@ -173,3 +243,4 @@ async def web_server_loop(db_path: str):
         await asyncio.Event().wait()  # sleep forever; cancellable from main()
     finally:
         await runner.cleanup()
+
