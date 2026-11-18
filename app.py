@@ -5,6 +5,9 @@ Delivery paths:
   * Android app users     — every device subscribed to FCM topic "kojo-alerts"
                             receives a data-only high-priority push.
 Both transports are queued independently and drained by dedicated loops.
+
+Web frontend is optional. If aiohttp is missing or web.py fails to import,
+the bot and both delivery paths continue to run normally.
 """
 from __future__ import annotations
 
@@ -28,6 +31,15 @@ import config
 from bot import register_handlers, broadcast_alert, reminder_loop
 from push import send_topic_alert, validate_firebase_config
 from signal_parser import parse_signals, valid_signals
+
+# --- Optional web frontend: failure here must NOT take down the bot ---
+try:
+    from web import web_server_loop as _web_server_loop
+    _WEB_IMPORT_ERROR: Exception | None = None
+except Exception as _exc:
+    _web_server_loop = None
+    _WEB_IMPORT_ERROR = _exc
+
 
 logging.basicConfig(level=config.LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("kojo-alert")
@@ -93,7 +105,8 @@ async def init_db():
         async with db.execute("PRAGMA table_info(source_messages)") as cur:
             cols = {row[1] for row in await cur.fetchall()}
         for col, ddl in [
-            ("content_hash", "TEXT"), ("alert_id", "TEXT"),
+            ("content_hash", "TEXT"),
+            ("alert_id", "TEXT"),
             ("is_edit", "INTEGER NOT NULL DEFAULT 0"),
             ("previous_alert_id", "TEXT"),
             ("error_count", "INTEGER NOT NULL DEFAULT 0"),
@@ -191,7 +204,7 @@ async def classify_strategy(message_text: str, signals: list[dict]) -> dict:
         return {"is_strategy": False, "confidence": 0.0, "reason": "classifier timeout"}
     except GroqBadRequest as exc:
         log.warning("Groq rejected the request (won't retry): %s", str(exc)[:300])
-        return {"is_strategy": False, "confidence": 0.0, "reason": f"classifier bad request"}
+        return {"is_strategy": False, "confidence": 0.0, "reason": "classifier bad request"}
     except (GroqConnectionError, GroqTimeout, GroqAPIStatus) as exc:
         log.warning("Groq transient error: %s", str(exc)[:300])
         raise
@@ -276,7 +289,10 @@ async def save_source_message(message, edited: bool = False) -> bool:
                 (text, message_date, source_url, config.utcnow(), digest, event_id, previous_alert_id, message_id),
             )
             if previous_alert_id:
-                await db.execute("UPDATE alert_deliveries SET acknowledged=1,next_attempt_at=NULL WHERE alert_id=?", (previous_alert_id,))
+                await db.execute(
+                    "UPDATE alert_deliveries SET acknowledged=1,next_attempt_at=NULL WHERE alert_id=?",
+                    (previous_alert_id,),
+                )
                 await db.execute(
                     "UPDATE telegram_outbox SET delivered_at=COALESCE(delivered_at,?),last_error='Superseded by an edited source post' "
                     "WHERE alert_id=? AND delivered_at IS NULL",
@@ -708,7 +724,10 @@ async def main():
     register_handlers(telegram_app, config.DATABASE_PATH)
     await telegram_app.initialize()
     await telegram_app.start()
-    await telegram_app.updater.start_polling(drop_pending_updates=False)
+    await telegram_app.updater.start_polling(
+        drop_pending_updates=False,
+        error_callback=telegram_app.bot_data.get("_polling_error_cb"),
+    )
 
     tasks = [
         asyncio.create_task(monitor_loop(), name="telegram-monitor"),
@@ -717,11 +736,30 @@ async def main():
         asyncio.create_task(fcm_outbox_loop(), name="fcm-outbox"),
         asyncio.create_task(telegram_outbox_loop(telegram_app), name="telegram-outbox"),
         asyncio.create_task(reminder_loop(telegram_app, config.DATABASE_PATH), name="telegram-reminders"),
-        # asyncio.create_task(web_server_loop(config.DATABASE_PATH), name="web-frontend"),
     ]
 
-    log.info("KOJO ALERT worker started (fast_path=%s, outbox_poll=%ss, channel_poll=%ss)",
-             config.GROQ_FAST_PATH, config.OUTBOX_POLL_SECONDS, config.CHANNEL_POLL_SECONDS)
+    # --- Optional web frontend: never blocks the bot even if it crashes ---
+    if _web_server_loop is not None:
+        async def _web_task():
+            while True:
+                try:
+                    await _web_server_loop(config.DATABASE_PATH)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("Web server crashed; restarting in 10s")
+                    await asyncio.sleep(10)
+
+        tasks.append(asyncio.create_task(_web_task(), name="web-frontend"))
+        log.info("Web frontend enabled")
+    else:
+        log.warning("Web frontend disabled — import failed: %s", _WEB_IMPORT_ERROR)
+
+    log.info(
+        "KOJO ALERT worker started (fast_path=%s, outbox_poll=%ss, channel_poll=%ss, groq_max_tokens=%d, max_retries=%d)",
+        config.GROQ_FAST_PATH, config.OUTBOX_POLL_SECONDS, config.CHANNEL_POLL_SECONDS,
+        GROQ_MAX_TOKENS, MAX_PROCESS_RETRIES,
+    )
 
     try:
         await asyncio.gather(*tasks)

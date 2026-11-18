@@ -22,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 import aiosqlite
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
+from telegram.error import BadRequest, Conflict, Forbidden, NetworkError, RetryAfter, TelegramError
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes,
 )
@@ -41,7 +41,7 @@ def _now():
 
 
 # ---------------------------------------------------------------------------
-# Formatting — professional, distinct for each state
+# Formatting
 # ---------------------------------------------------------------------------
 
 def _format_signal_block(signal: dict) -> str:
@@ -65,12 +65,12 @@ def format_alert(alert: dict, reminder: bool = False) -> str:
     analysis = alert.get("analysis") or {}
     signals = analysis.get("signals") or []
 
-    # --- Correction path ---
     if analysis.get("correction"):
-        if reminder:
-            header = "⏰ <b>REMINDER — CORRECTION NOT ACKNOWLEDGED</b>"
-        else:
-            header = "⚠️ <b>KOJO ALERT — SOURCE POST UPDATED</b>"
+        header = (
+            "⏰ <b>REMINDER — CORRECTION NOT ACKNOWLEDGED</b>"
+            if reminder
+            else "⚠️ <b>KOJO ALERT — SOURCE POST UPDATED</b>"
+        )
         return "\n".join([
             header,
             "━━━━━━━━━━━━━━━━━━━━━━━━━",
@@ -86,7 +86,6 @@ def format_alert(alert: dict, reminder: bool = False) -> str:
             "<i>Automated correction notice. Verify the source.</i>",
         ])
 
-    # --- Reminder is visually distinct so it cannot be confused with a new alert ---
     confidence = round(float(analysis.get("confidence", 0)) * 100)
     if reminder:
         header = "⏰ <b>REMINDER — UNACKNOWLEDGED ALERT</b>"
@@ -396,7 +395,6 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _show_history(chat_id: int, message, context):
-    """Show this user's actual delivery history — not raw source messages."""
     limit = config.TELEGRAM_HISTORY_LIMIT
     async with aiosqlite.connect(context.application.bot_data["db_path"]) as db:
         async with db.execute(
@@ -685,16 +683,9 @@ def _subscriber_accepts(sub_row, alert: dict) -> bool:
 
 
 async def broadcast_alert(application: Application, db_path: str, alert: dict):
-    """Fan out one alert to matching subscribers.
-
-    Idempotent at the row level: INSERT OR IGNORE for delivery rows, and each
-    row is atomically claimed by deliver_one. Calling this twice for the same
-    alert_id will NOT double-send.
-    """
     alert_id = str(alert.get("alert_id") or alert["message_id"])
     message_id = int(alert["message_id"])
 
-    # 1) Ensure a delivery row exists for every matching subscriber.
     async with aiosqlite.connect(db_path) as db:
         async with db.execute(
             "SELECT chat_id,active,paused_until,filter_directions FROM subscribers"
@@ -717,7 +708,6 @@ async def broadcast_alert(application: Application, db_path: str, alert: dict):
                 continue
         await db.commit()
 
-    # 2) Find rows that are due for their first send.
     async with aiosqlite.connect(db_path) as db:
         async with db.execute(
             "SELECT chat_id FROM alert_deliveries "
@@ -741,12 +731,7 @@ async def broadcast_alert(application: Application, db_path: str, alert: dict):
 
 
 async def deliver_one(application, db_path, chat_id, alert_id, alert=None, initial=False):
-    """Deliver one alert to one chat with an ATOMIC CLAIM before the send.
-
-    If two triggers (event drain + reminder loop) race, only the winner of the
-    atomic UPDATE proceeds to send. The loser returns immediately. This is the
-    primary defense against duplicate messages.
-    """
+    """Deliver one alert to one chat with an ATOMIC CLAIM before the send."""
     async with aiosqlite.connect(db_path) as db:
         async with db.execute(
             "SELECT attempts,acknowledged,alert_json FROM alert_deliveries WHERE chat_id=? AND alert_id=?",
@@ -761,7 +746,7 @@ async def deliver_one(application, db_path, chat_id, alert_id, alert=None, initi
         if alert is None:
             alert = json.loads(alert_json or "{}")
 
-        # --- ATOMIC CLAIM (must run before send) ---
+        # ATOMIC CLAIM (runs before send)
         if initial:
             claim_sql = (
                 "UPDATE alert_deliveries SET attempts=attempts+1, next_attempt_at=?, last_error='sending' "
@@ -780,7 +765,6 @@ async def deliver_one(application, db_path, chat_id, alert_id, alert=None, initi
         if claim.rowcount != 1:
             return  # lost the race, or already acked, or not due
 
-    # We own this delivery. Send it.
     kind = "initial" if initial else "reminder"
     try:
         sent = await application.bot.send_message(
@@ -857,15 +841,28 @@ async def reminder_loop(application: Application, db_path: str):
 
 
 # ---------------------------------------------------------------------------
-# Registration
+# Error handlers (including polling 409 suppression)
 # ---------------------------------------------------------------------------
 
 async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.exception("PTB handler error", exc_info=context.error)
 
 
+async def _polling_error_callback(exc: TelegramError) -> None:
+    """Silence the deploy-transition 409. Everything else gets a warning."""
+    if isinstance(exc, Conflict):
+        # Expected while Render swaps old→new instance. PTB retries automatically.
+        log.warning("409 Conflict: another instance is polling. Waiting for it to stop.")
+        return
+    if isinstance(exc, NetworkError):
+        log.warning("Polling network error: %s", exc)
+        return
+    log.warning("Polling error: %s", exc)
+
+
 def register_handlers(application: Application, db_path: str):
     application.bot_data["db_path"] = db_path
+    application.bot_data["_polling_error_cb"] = _polling_error_callback
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("menu", cmd_menu))
     application.add_handler(CommandHandler("stop", cmd_stop))
