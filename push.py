@@ -1,9 +1,12 @@
-"""Firebase Cloud Messaging publisher — minimal payload for low-bandwidth delivery.
+"""Firebase Cloud Messaging publisher.
 
-The FCM data payload is deliberately tiny (~250 bytes) so it arrives even on
-very slow links. Detailed content (original_text, full signal list) is fetched
-by the app via /api/alerts/since once the push lands. The FCM message is a
-"wake signal" — the app fetches the rest.
+Payload includes every field the Android app needs to render the full
+notification (direction, instrument, entry, stop loss, all take-profits,
+order type, confidence). The only field intentionally omitted is
+`original_text` (~1000 bytes) — the app can fetch it via /api/alerts/since
+if it ever needs the raw source post.
+
+TTL is 4 weeks (FCM max) so offline devices still receive when they reconnect.
 """
 from __future__ import annotations
 
@@ -46,46 +49,72 @@ def validate_firebase_config() -> None:
 
 
 def _s(value, limit=200):
-    """Aggressively truncate — every byte matters on slow links."""
     return str(value if value is not None else "")[:limit]
 
 
-def _compact_tp(targets: list) -> str:
-    """Serialize take-profits as 'tp1|tp2|tp3' — ~8 bytes vs JSON's ~30 bytes."""
-    return "|".join(_s(x, 20) for x in (targets or [])[:5])
-
-
 def build_fcm_payload(alert: dict, signal: dict, index: int) -> dict[str, str]:
-    """Minimal payload — app fetches full details via /api/alerts/since.
+    """Full-detail payload — every field the app's FullScreenAlertActivity reads.
 
-    Target size: ~250 bytes. Original was ~2000 bytes. That's the difference
-    between arriving on a 5 kbps link and not.
+    Field names match the original (long) schema so the existing app decodes
+    them without changes. Only `original_text` is omitted to keep the message
+    small enough for slow networks.
     """
     message_id = int(alert["message_id"])
+    base_id = _s(alert.get("alert_id") or message_id, 64)
+    alert_id = f"{base_id}-{index + 1}"[:64]
+    direction = _s(signal.get("direction"), 12)
+    instrument = _s(signal.get("instrument"), 20)
+    order = _s(signal.get("order_type") or "MARKET", 12)
+    targets = signal.get("take_profit") or []
     return {
-        # Identity (needed for dedupe and catch-up sync)
-        "a": _s(alert.get("alert_id") or message_id, 64),   # alert_id
-        "m": str(message_id),                                # message_id
-        "u": _s(alert.get("source_url"), 120),              # source_url
-        "i": _s(signal.get("instrument"), 20),              # instrument
-        "d": _s(signal.get("direction"), 8),                # direction
-        "o": _s(signal.get("order_type") or "MARKET", 8),   # order_type
-        "e": _s(signal.get("entry"), 20),                   # entry
-        "s": _s(signal.get("stop_loss"), 20),               # stop_loss
-        "t": _compact_tp(signal.get("take_profit") or []),  # take_profit
-        "n": str(index + 1),                                # signal_number
-        "c": str(len((alert.get("analysis") or {}).get("signals") or [])),  # count
-        "k": "1",                                           # kind: "1"=signal, "0"=correction
+        # Identity
+        "alert_id": alert_id,
+        "message_id": str(message_id),
+        "source_url": _s(alert.get("source_url"), 300),
+        # Display
+        "title": f"KOJO ALERT — {direction} {instrument}",
+        "body": f"{order} · Entry {signal.get('entry')} · SL {signal.get('stop_loss')}",
+        # Structured details (the app reads these directly)
+        "instrument": instrument,
+        "direction": direction,
+        "order_type": order,
+        "entry": _s(signal.get("entry"), 40),
+        "stop_loss": _s(signal.get("stop_loss"), 40),
+        "take_profit": json.dumps([_s(x, 40) for x in targets[:8]]),
+        "confidence": _s((alert.get("analysis") or {}).get("confidence", 0), 12),
+        # Signal ordinal
+        "signal_number": str(index + 1),
+        "signal_count": str(len((alert.get("analysis") or {}).get("signals") or [])),
+        # Notification behaviour
+        "priority": "high",
+        "channel_id": config.FCM_CHANNEL_ID,
+        "full_screen": "true",
+        "category": "kojo_trade_alert",
+        # NOTE: original_text is intentionally NOT sent here — the app can
+        # fetch it from /api/alerts/since when rendering the detail screen.
     }
 
 
 def _correction_payload(alert: dict) -> dict[str, str]:
     return {
-        "a": _s(alert.get("alert_id") or alert.get("message_id"), 64),
-        "m": str(alert["message_id"]),
-        "u": _s(alert.get("source_url"), 120),
-        "d": "UPDATE",
-        "k": "0",  # correction
+        "alert_id": _s(alert.get("alert_id") or alert.get("message_id"), 64),
+        "message_id": str(alert["message_id"]),
+        "source_url": _s(alert.get("source_url"), 300),
+        "title": "KOJO ALERT — SOURCE POST UPDATED",
+        "body": "The original trading post was edited. Review it before acting on the previous signal.",
+        "instrument": "",
+        "direction": "UPDATE",
+        "order_type": "UPDATE",
+        "entry": "",
+        "stop_loss": "",
+        "take_profit": "[]",
+        "confidence": "1",
+        "signal_number": "0",
+        "signal_count": "0",
+        "priority": "high",
+        "channel_id": config.FCM_CHANNEL_ID,
+        "full_screen": "true",
+        "category": "kojo_trade_alert",
     }
 
 
@@ -108,9 +137,9 @@ def send_topic_alert(alert: dict) -> list[str]:
             data=payload,
             android=messaging.AndroidConfig(
                 priority="high",
-                ttl=timedelta(weeks=4),               # 28 days — FCM's max
-                collapse_key=f"kojo-{payload['m']}",  # collapse duplicates
-                direct_boot_ok=True,                  # deliver before unlock
+                ttl=timedelta(weeks=4),
+                collapse_key=f"kojo-{payload['message_id']}",
+                direct_boot_ok=True,
             ),
         )
         message_ids.append(messaging.send(message, app=app))
